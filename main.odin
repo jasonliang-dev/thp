@@ -61,11 +61,16 @@ template :: proc(L: ^lua.State, filename: string) -> cstring {
 		}
 	}
 
-	strings.write_byte(&out, 0)
+	name := strings.clone_to_cstring(filename, context.temp_allocator)
 
-	str := strings.unsafe_string_to_cstring(strings.to_string(out))
-	err := lua.L_dostring(L, str)
-	if err != 0 {
+	str := strings.to_string(out)
+	status := lua.L_loadbuffer(L, raw_data(str), len(str), name)
+	if status != .OK {
+		return lua.L_checkstring(L, -1)
+	}
+
+	res := lua.pcall(L, 0, lua.MULTRET, 0)
+	if res != 0 {
 		return lua.L_checkstring(L, -1)
 	}
 
