@@ -32,6 +32,33 @@ scanner_match :: proc(s: ^Scanner, str: string) -> bool {
 	return matches
 }
 
+scanner_next :: proc(s: ^Scanner) -> string {
+	is_whitespace :: proc(c: u8) -> bool {
+		switch c {
+		case '\n', '\r', '\t', ' ':
+			return true
+		case:
+			return false
+		}
+	}
+
+	for s.pos < s.end && is_whitespace(s.data[s.pos]) {
+		s.pos += 1
+	}
+
+	begin := s.pos
+
+	if s.pos == s.end {
+		return ""
+	}
+
+	for s.pos < s.end && !is_whitespace(s.data[s.pos]) {
+		s.pos += 1
+	}
+
+	return s.data[begin:s.pos]
+}
+
 template :: proc(L: ^lua.State, filename: string) -> cstring {
 	strings.builder_reset(&g_echobuf)
 
@@ -88,11 +115,12 @@ send :: proc(client: net.TCP_Socket, status: string, type: string, body: string)
 	return nil
 }
 
-serve :: proc(L: ^lua.State) -> net.Network_Error {
-	addr :: "localhost:8080"
+send_status :: proc(client: net.TCP_Socket, status: string) -> net.Network_Error {
+	return send(client, status, "text/plain", status)
+}
 
+serve :: proc(L: ^lua.State, addr: string) -> net.Network_Error {
 	ep := net.resolve_ip4(addr) or_return
-
 	sock := net.listen_tcp(ep) or_return
 	defer net.close(sock)
 
@@ -105,7 +133,25 @@ serve :: proc(L: ^lua.State) -> net.Network_Error {
 		buf: [2048]u8
 		bytes := net.recv(client, buf[:]) or_return
 
-		err := template(L, "index.html")
+		scan := make_scanner(string(buf[:]))
+		method := scanner_next(&scan)
+		if method != "GET" {
+			send_status(client, "405 Method Not Allowed") or_return
+			continue
+		}
+
+		location := scanner_next(&scan)
+		location = location[1:]
+		if location == "" {
+			location = "index.html"
+		}
+
+		if !os.is_file(location) {
+			send(client, "404 Not Found", "text/plain", fmt.tprintf("'%s' Not Found", location)) or_return
+			continue
+		}
+
+		err := template(L, location)
 		if err != "" {
 			send(client, "500 Internal Server Error", "text/plain", string(err)) or_return
 			continue
@@ -113,6 +159,14 @@ serve :: proc(L: ^lua.State) -> net.Network_Error {
 
 		send(client, "200 OK", "text/html", strings.to_string(g_echobuf)) or_return
 	}
+}
+
+usage :: proc() {
+	fmt.eprintf("usage: %s command [args]\n", os.args[0])
+	fmt.eprintln(`commands:
+	serve               run development server in current directory
+	build <file>        build a single template file
+	dist <from> <to>    build all files in a directory`)
 }
 
 main :: proc() {
@@ -129,8 +183,43 @@ main :: proc() {
 	})
 	lua.setglobal(L, "echo")
 
-	err := serve(L)
-	if err != nil {
-		fmt.eprintln(err)
+	if len(os.args) != 2 && len(os.args) != 3 {
+		usage()
+		return
+	}
+
+	switch os.args[1] {
+	case "serve":
+		addr: string
+		if len(os.args) == 3 {
+			addr = os.args[2]
+		} else {
+			addr = "localhost:8080"
+		}
+
+		err := serve(L, addr)
+		if err != nil {
+			fmt.eprintln(err)
+		}
+	case "build":
+		if len(os.args) != 3 {
+			usage()
+			return
+		}
+
+		err := template(L, os.args[2])
+		if err != "" {
+			fmt.eprintln(string(err))
+			return
+		}
+
+		fmt.println(strings.to_string(g_echobuf))
+	case "dist":
+		if len(os.args) != 3 {
+			usage()
+			return
+		}
+	case:
+		usage()
 	}
 }
