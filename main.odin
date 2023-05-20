@@ -59,12 +59,11 @@ scanner_next :: proc(s: ^Scanner) -> string {
 	return s.data[begin:s.pos]
 }
 
-template :: proc(L: ^lua.State, filename: string) -> cstring {
-	strings.builder_reset(&g_echobuf)
-
-	contents, ok := os.read_entire_file_from_filename(filename)
+transpile :: proc(filename: string) -> (lua_code: string, err: cstring) {
+	contents, ok := os.read_entire_file(filename)
 	if !ok {
-		return ""
+		err = "failed to read file"
+		return
 	}
 
 	builder := strings.builder_make()
@@ -88,20 +87,33 @@ template :: proc(L: ^lua.State, filename: string) -> cstring {
 		}
 	}
 
+	lua_code = strings.to_string(out)
+	return
+}
+
+template :: proc(L: ^lua.State, filename: string) -> (tmpl: string, err: cstring) {
+	code: string
+	code, err = transpile(filename)
+	if err != "" {
+		return
+	}
+
 	name := strings.clone_to_cstring(filename, context.temp_allocator)
 
-	str := strings.to_string(out)
-	status := lua.L_loadbuffer(L, raw_data(str), len(str), name)
+	status := lua.L_loadbuffer(L, raw_data(code), len(code), name)
 	if status != .OK {
-		return lua.L_checkstring(L, -1)
+		err = lua.L_checkstring(L, -1)
+		return
 	}
 
 	res := lua.pcall(L, 0, lua.MULTRET, 0)
 	if res != 0 {
-		return lua.L_checkstring(L, -1)
+		err = lua.L_checkstring(L, -1)
+		return
 	}
 
-	return ""
+	tmpl = strings.to_string(g_echobuf)
+	return
 }
 
 send :: proc(client: net.TCP_Socket, status: string, type: string, body: string) -> net.Network_Error {
@@ -119,54 +131,94 @@ send_status :: proc(client: net.TCP_Socket, status: string) -> net.Network_Error
 	return send(client, status, "text/plain", status)
 }
 
-serve :: proc(L: ^lua.State, addr: string) -> net.Network_Error {
+handle_request :: proc(L: ^lua.State, sock: net.TCP_Socket) -> net.Network_Error {
+	client, source := net.accept_tcp(sock) or_return
+	defer net.close(client)
+
+	buf: [2048]u8
+	bytes := net.recv(client, buf[:]) or_return
+
+	scan := make_scanner(string(buf[:]))
+	method := scanner_next(&scan)
+	if method != "GET" {
+		send_status(client, "405 Method Not Allowed") or_return
+		return nil
+	}
+
+	location := scanner_next(&scan)
+	location = location[1:]
+	if location == "" {
+		location = "index.html"
+	}
+
+	if !os.is_file(location) {
+		send(client, "404 Not Found", "text/plain", fmt.tprintf("'%s' Not Found", location)) or_return
+		return nil
+	}
+
+	if strings.has_suffix(location, ".html") {
+		strings.builder_reset(&g_echobuf)
+		tmpl, err := template(L, location)
+		if err != "" {
+			send(client, "500 Internal Server Error", "text/plain", string(err)) or_return
+			return nil
+		}
+
+		send(client, "200 OK", "text/html", tmpl) or_return
+	} else {
+		contents, ok := os.read_entire_file(location)
+		if !ok {
+			send_status(client, "500 Internal Server Error") or_return
+			return nil
+		}
+
+		type: string
+		if strings.has_suffix(location, ".css") {
+			type = "text/css"
+		} else if strings.has_suffix(location, ".js") {
+			type = "text/javascript"
+		} else if strings.has_suffix(location, ".png") {
+			type = "image/png"
+		} else if strings.has_suffix(location, ".jpg") {
+			type = "image/jpeg"
+		} else if strings.has_suffix(location, ".jpeg") {
+			type = "image/jpeg"
+		} else if strings.has_suffix(location, ".ttf") {
+			type = "font/ttf"
+		} else if strings.has_suffix(location, ".weba") {
+			type = "audio/webm"
+		} else if strings.has_suffix(location, ".webm") {
+			type = "video/webm"
+		} else {
+			type = "text/plain"
+		}
+
+		send(client, "200 OK", type, string(contents)) or_return
+	}
+
+	return nil
+}
+
+serve :: proc(L: ^lua.State, dir: string, addr: string) -> net.Network_Error {
+	os.change_directory(dir)
+
 	ep := net.resolve_ip4(addr) or_return
 	sock := net.listen_tcp(ep) or_return
 	defer net.close(sock)
 
-	fmt.printf("listening (%v)\n", addr)
+	fmt.printf("serving '%s' on %v\n", dir, addr)
 
 	for {
-		client, source := net.accept_tcp(sock) or_return
-		defer net.close(client)
-
-		buf: [2048]u8
-		bytes := net.recv(client, buf[:]) or_return
-
-		scan := make_scanner(string(buf[:]))
-		method := scanner_next(&scan)
-		if method != "GET" {
-			send_status(client, "405 Method Not Allowed") or_return
-			continue
-		}
-
-		location := scanner_next(&scan)
-		location = location[1:]
-		if location == "" {
-			location = "index.html"
-		}
-
-		if !os.is_file(location) {
-			send(client, "404 Not Found", "text/plain", fmt.tprintf("'%s' Not Found", location)) or_return
-			continue
-		}
-
-		err := template(L, location)
-		if err != "" {
-			send(client, "500 Internal Server Error", "text/plain", string(err)) or_return
-			continue
-		}
-
-		send(client, "200 OK", "text/html", strings.to_string(g_echobuf)) or_return
+		handle_request(L, sock)
 	}
 }
 
 usage :: proc() {
 	fmt.eprintf("usage: %s command [args]\n", os.args[0])
 	fmt.eprintln(`commands:
-	serve               run development server in current directory
-	build <file>        build a single template file
-	dist <from> <to>    build all files in a directory`)
+	serve <dir> [address]    run development server for given directory
+	build <file>             build a single template file
+	build_dir <from> <to>    build all files in a directory`)
 }
 
 main :: proc() {
@@ -186,13 +238,27 @@ main :: proc() {
 	lua.pushcfunction(L, proc "cdecl" (L: ^lua.State) -> i32 {
 		context = runtime.default_context()
 
-		filename := lua.L_checkstring(L, 1)
-		contents, ok := os.read_entire_file_from_filename(string(filename))
-		if !ok {
-			return i32(lua.L_error(L, "cannot read file '%s'", filename))
+		top := lua.gettop(L)
+
+		c_filename := lua.L_checkstring(L, 1)
+		filename := string(c_filename)
+
+		code: string
+		if strings.has_suffix(filename, ".html") {
+			err: cstring
+			code, err = transpile(filename)
+			if err != "" {
+				return i32(lua.L_error(L, "error while importing '%s': %s", c_filename, err))
+			}
+		} else if strings.has_suffix(filename, ".lua") {
+			contents, ok := os.read_entire_file(filename)
+			if !ok {
+				return i32(lua.L_error(L, "cannot read file '%s'", c_filename))
+			}
+			code = string(contents)
 		}
 
-		status := lua.L_loadbuffer(L, raw_data(contents), len(contents), filename)
+		status := lua.L_loadbuffer(L, raw_data(code), len(code), c_filename)
 		if status != .OK {
 			return i32(lua.error(L))
 		}
@@ -202,25 +268,33 @@ main :: proc() {
 			return i32(lua.error(L))
 		}
 
-		return 1
+		args := lua.gettop(L) - top
+		return args
 	})
 	lua.setglobal(L, "import")
 
-	if len(os.args) != 2 && len(os.args) != 3 {
+	if len(os.args) < 3 {
 		usage()
 		return
 	}
 
 	switch os.args[1] {
 	case "serve":
+		if len(os.args) != 3 && len(os.args) != 4 {
+			usage()
+			return
+		}
+
+		dir := os.args[2]
+
 		addr: string
-		if len(os.args) == 3 {
-			addr = os.args[2]
+		if len(os.args) == 4 {
+			addr = os.args[3]
 		} else {
 			addr = "localhost:8080"
 		}
 
-		err := serve(L, addr)
+		err := serve(L, dir, addr)
 		if err != nil {
 			fmt.eprintln(err)
 		}
@@ -230,17 +304,89 @@ main :: proc() {
 			return
 		}
 
-		err := template(L, os.args[2])
+		strings.builder_reset(&g_echobuf)
+		tmpl, err := template(L, os.args[2])
 		if err != "" {
 			fmt.eprintln(string(err))
 			return
 		}
 
-		fmt.println(strings.to_string(g_echobuf))
-	case "dist":
-		if len(os.args) != 3 {
+		fmt.println(tmpl)
+	case "build_dir":
+		if len(os.args) != 4 {
 			usage()
 			return
+		}
+
+		errno: os.Errno
+
+		from: os.File_Info
+		to: os.File_Info
+
+		from, errno = os.stat(os.args[2])
+		to, errno = os.stat(os.args[3])
+
+		errno = os.remove_directory(to.fullpath)
+		if errno != 0 {
+			fmt.eprintln("failed to remove: ", to.fullpath)
+		}
+
+		errno = os.make_directory(to.fullpath)
+
+		fd: os.Handle
+		fd, errno = os.open(from.fullpath)
+		if errno != 0 {
+			fmt.eprintln("failed to open: ", from.fullpath)
+			return
+		}
+		defer os.close(fd)
+
+		fi: []os.File_Info
+		fi, errno = os.read_dir(fd, 0)
+		if errno != 0 {
+			fmt.eprintf("failed to read dir: %v", from.fullpath)
+			return
+		}
+
+		os.change_directory(from.fullpath)
+
+		for info in fi {
+			fmt.println(info.name)
+
+			dst := fmt.tprintf("%s/%s", to.fullpath, info.name)
+
+			if info.is_dir {
+				continue
+			}
+
+			if info.name[0] == '_' {
+				continue
+			}
+
+			if strings.has_suffix(info.name, ".html") {
+				strings.builder_reset(&g_echobuf)
+				tmpl, err := template(L, info.fullpath)
+				if err != "" {
+					fmt.eprintln(string(err))
+					return
+				}
+
+				ok := os.write_entire_file(dst, transmute([]u8)tmpl)
+				if !ok {
+					fmt.eprintln("failed to write file: ", dst)
+				}
+			} else {
+				contents, ok := os.read_entire_file(info.fullpath)
+				if !ok {
+					fmt.eprintln("failed to read file: ", info.fullpath)
+					return
+				}
+
+				ok = os.write_entire_file(dst, contents)
+				if !ok {
+					fmt.eprintln("failed to write file: ", dst)
+				}
+			}
 		}
 	case:
 		usage()
