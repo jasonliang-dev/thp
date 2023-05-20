@@ -183,6 +183,29 @@ main :: proc() {
 	})
 	lua.setglobal(L, "echo")
 
+	lua.pushcfunction(L, proc "cdecl" (L: ^lua.State) -> i32 {
+		context = runtime.default_context()
+
+		filename := lua.L_checkstring(L, 1)
+		contents, ok := os.read_entire_file_from_filename(string(filename))
+		if !ok {
+			return i32(lua.L_error(L, "cannot read file '%s'", filename))
+		}
+
+		status := lua.L_loadbuffer(L, raw_data(contents), len(contents), filename)
+		if status != .OK {
+			return i32(lua.error(L))
+		}
+
+		res := lua.pcall(L, 0, lua.MULTRET, 0)
+		if res != 0 {
+			return i32(lua.error(L))
+		}
+
+		return 1
+	})
+	lua.setglobal(L, "import")
+
 	if len(os.args) != 2 && len(os.args) != 3 {
 		usage()
 		return
