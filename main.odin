@@ -400,7 +400,7 @@ usage :: proc() {
 	fmt.eprintln(`commands:
 	serve <dir> [address]    run development server for given directory
 	build <file>             build a single template file
-	build_dir <from> <to>    build all files in a directory`)
+	build_dir <src> <dst>    build all files in a directory`)
 }
 
 main :: proc() {
