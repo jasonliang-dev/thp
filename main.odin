@@ -59,12 +59,13 @@ scanner_next :: proc(s: ^Scanner) -> string {
 	return s.data[begin:s.pos]
 }
 
-transpile :: proc(filename: string) -> (lua_code: string, err: cstring) {
-	contents, ok := os.read_entire_file(filename)
+transpile :: proc(filename: string) -> (lua_code: string, ok: bool) {
+	contents: []u8
+	contents, ok = os.read_entire_file(filename)
 	if !ok {
-		err = "failed to read file"
 		return
 	}
+	defer delete(contents)
 
 	builder := strings.builder_make()
 	defer strings.builder_destroy(&builder)
@@ -91,24 +92,27 @@ transpile :: proc(filename: string) -> (lua_code: string, err: cstring) {
 	return
 }
 
-template :: proc(L: ^lua.State, filename: string) -> (tmpl: string, err: cstring) {
-	code: string
-	code, err = transpile(filename)
-	if err != "" {
+template :: proc(L: ^lua.State, filename: string) -> (tmpl: string, err: string) {
+	strings.builder_reset(&g_echobuf)
+
+	code, ok := transpile(filename)
+	if !ok {
+		err = fmt.tprintf("failed to transpile file: %s", filename)
 		return
 	}
+	defer delete(code)
 
 	name := strings.clone_to_cstring(filename, context.temp_allocator)
 
 	status := lua.L_loadbuffer(L, raw_data(code), len(code), name)
 	if status != .OK {
-		err = lua.L_checkstring(L, -1)
+		err = string(lua.L_checkstring(L, -1))
 		return
 	}
 
 	res := lua.pcall(L, 0, lua.MULTRET, 0)
 	if res != 0 {
-		err = lua.L_checkstring(L, -1)
+		err = string(lua.L_checkstring(L, -1))
 		return
 	}
 
@@ -157,10 +161,9 @@ handle_request :: proc(L: ^lua.State, sock: net.TCP_Socket) -> net.Network_Error
 	}
 
 	if strings.has_suffix(location, ".html") {
-		strings.builder_reset(&g_echobuf)
 		tmpl, err := template(L, location)
 		if err != "" {
-			send(client, "500 Internal Server Error", "text/plain", string(err)) or_return
+			send(client, "500 Internal Server Error", "text/plain", err) or_return
 			return nil
 		}
 
@@ -171,6 +174,7 @@ handle_request :: proc(L: ^lua.State, sock: net.TCP_Socket) -> net.Network_Error
 			send_status(client, "500 Internal Server Error") or_return
 			return nil
 		}
+		defer delete(contents)
 
 		type: string
 		if strings.has_suffix(location, ".css") {
@@ -183,12 +187,22 @@ handle_request :: proc(L: ^lua.State, sock: net.TCP_Socket) -> net.Network_Error
 			type = "image/jpeg"
 		} else if strings.has_suffix(location, ".jpeg") {
 			type = "image/jpeg"
+		} else if strings.has_suffix(location, ".gif") {
+			type = "image/gif"
 		} else if strings.has_suffix(location, ".ttf") {
 			type = "font/ttf"
 		} else if strings.has_suffix(location, ".weba") {
 			type = "audio/webm"
 		} else if strings.has_suffix(location, ".webm") {
 			type = "video/webm"
+		} else if strings.has_suffix(location, ".mp3") {
+			type = "audio/mpeg"
+		} else if strings.has_suffix(location, ".mp4") {
+			type = "video/mp4"
+		} else if strings.has_suffix(location, ".pdf") {
+			type = "application/pdf"
+		} else if strings.has_suffix(location, ".json") {
+			type = "application/json"
 		} else {
 			type = "text/plain"
 		}
@@ -206,11 +220,179 @@ serve :: proc(L: ^lua.State, dir: string, addr: string) -> net.Network_Error {
 	sock := net.listen_tcp(ep) or_return
 	defer net.close(sock)
 
-	fmt.printf("serving '%s' on %v\n", dir, addr)
+	fmt.printf("serving '%s' on %s\n", dir, addr)
 
 	for {
 		handle_request(L, sock)
 	}
+}
+
+remove_dir_recursive :: proc(dirname: string) -> os.Errno {
+	fd, errno := os.open(dirname)
+	if errno != 0 {
+		return errno
+	}
+
+	{
+		defer os.close(fd)
+
+		fi: []os.File_Info
+		fi, errno = os.read_dir(fd, 0)
+		if errno != 0 {
+			return errno
+		}
+
+		for info in fi {
+			if info.is_dir {
+				errno = remove_dir_recursive(info.fullpath)
+			} else {
+				errno = os.remove(info.fullpath)
+			}
+
+			if errno != 0 {
+				return errno
+			}
+		}
+	}
+
+	os.remove_directory(dirname)
+
+	return 0
+}
+
+BuildDirError :: enum {
+	None,
+	StatError,
+	DirectoryError,
+	ReadWriteError,
+	TemplateError,
+	HandleError,
+}
+
+build_dir_help :: proc(L: ^lua.State, from: string, to: string, stk: ^[dynamic]string) -> BuildDirError {
+	src_dir: string
+	dst_dir: string
+
+	if len(stk) != 0 {
+		path := strings.join(stk[:], "/", context.temp_allocator)
+		src_dir = fmt.tprintf("%s/%s", from, path)
+		dst_dir = fmt.tprintf("%s/%s", to, path)
+	} else {
+		src_dir = from
+		dst_dir = to
+	}
+
+	if !os.exists(dst_dir) {
+		errno := os.make_directory(dst_dir)
+		if errno != 0 {
+			return .DirectoryError
+		}
+
+		_, errno = os.stat(to)
+		if errno != 0 {
+			return .StatError
+		}
+	}
+
+	fd, errno := os.open(src_dir)
+	if errno != 0 {
+		return .HandleError
+	}
+	defer os.close(fd)
+
+	fi: []os.File_Info
+	fi, errno = os.read_dir(fd, 0)
+	if errno != 0 {
+		return .ReadWriteError
+	}
+
+	for info in fi {
+		dst: string
+		if len(stk) != 0 {
+			path := strings.join(stk[:], "/", context.temp_allocator)
+			dst = fmt.tprintf("%s/%s/%s", to, path, info.name)
+		} else {
+			dst = fmt.tprintf("%s/%s", to, info.name)
+		}
+
+		if info.name[0] == '_' {
+			continue
+		}
+
+		if info.is_dir {
+			append(stk, info.name)
+			err := build_dir_help(L, from, to, stk)
+			pop(stk)
+			if err != .None {
+				return err
+			}
+		} else {
+			fmt.println(dst)
+
+			if strings.has_suffix(info.name, ".html") {
+				tmpl, err := template(L, info.fullpath)
+				if err != "" {
+					return .TemplateError
+				}
+
+				ok := os.write_entire_file(dst, transmute([]u8)tmpl)
+				if !ok {
+					fmt.eprintln("cannot write: ", dst)
+					return .ReadWriteError
+				}
+			} else {
+				contents, ok := os.read_entire_file(info.fullpath)
+				if !ok {
+					fmt.eprintln("cannot read: ", info.fullpath)
+					return .ReadWriteError
+				}
+				defer delete(contents)
+
+				ok = os.write_entire_file(dst, contents)
+				if !ok {
+					fmt.eprintln("cannot write: ", dst)
+					return .ReadWriteError
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+build_dir :: proc(L: ^lua.State, from: string, to: string) -> BuildDirError {
+	errno: os.Errno
+
+	fi_from: os.File_Info
+	fi_from, errno = os.stat(from)
+	if errno != 0 {
+		return .StatError
+	}
+
+	if os.exists(to) {
+		errno = remove_dir_recursive(to)
+		if errno != 0 {
+			fmt.eprintln("cannot remove directory: ", errno, to)
+			return .DirectoryError
+		}
+	}
+
+	errno = os.make_directory(to)
+	if errno != 0 {
+		return .DirectoryError
+	}
+
+	fi_to: os.File_Info
+	fi_to, errno = os.stat(to)
+	if errno != 0 {
+		return .StatError
+	}
+
+	stk: [dynamic]string
+	defer delete(stk)
+
+	os.change_directory(fi_from.fullpath)
+	return build_dir_help(L, fi_from.fullpath, fi_to.fullpath, &stk)
 }
 
 usage :: proc() {
@@ -245,10 +427,10 @@ main :: proc() {
 
 		code: string
 		if strings.has_suffix(filename, ".html") {
-			err: cstring
-			code, err = transpile(filename)
-			if err != "" {
-				return i32(lua.L_error(L, "error while importing '%s': %s", c_filename, err))
+			ok: bool
+			code, ok = transpile(filename)
+			if !ok {
+				return i32(lua.L_error(L, "failed to transpile %s", c_filename))
 			}
 		} else if strings.has_suffix(filename, ".lua") {
 			contents, ok := os.read_entire_file(filename)
@@ -257,6 +439,7 @@ main :: proc() {
 			}
 			code = string(contents)
 		}
+		defer delete(code)
 
 		status := lua.L_loadbuffer(L, raw_data(code), len(code), c_filename)
 		if status != .OK {
@@ -304,7 +487,6 @@ main :: proc() {
 			return
 		}
 
-		strings.builder_reset(&g_echobuf)
 		tmpl, err := template(L, os.args[2])
 		if err != "" {
 			fmt.eprintln(string(err))
@@ -318,75 +500,9 @@ main :: proc() {
 			return
 		}
 
-		errno: os.Errno
-
-		from: os.File_Info
-		to: os.File_Info
-
-		from, errno = os.stat(os.args[2])
-		to, errno = os.stat(os.args[3])
-
-		errno = os.remove_directory(to.fullpath)
-		if errno != 0 {
-			fmt.eprintln("failed to remove: ", to.fullpath)
-		}
-
-		errno = os.make_directory(to.fullpath)
-
-		fd: os.Handle
-		fd, errno = os.open(from.fullpath)
-		if errno != 0 {
-			fmt.eprintln("failed to open: ", from.fullpath)
-			return
-		}
-		defer os.close(fd)
-
-		fi: []os.File_Info
-		fi, errno = os.read_dir(fd, 0)
-		if errno != 0 {
-			fmt.eprintf("failed to read dir: %v", from.fullpath)
-			return
-		}
-
-		os.change_directory(from.fullpath)
-
-		for info in fi {
-			fmt.println(info.name)
-
-			dst := fmt.tprintf("%s/%s", to.fullpath, info.name)
-
-			if info.is_dir {
-				continue
-			}
-
-			if info.name[0] == '_' {
-				continue
-			}
-
-			if strings.has_suffix(info.name, ".html") {
-				strings.builder_reset(&g_echobuf)
-				tmpl, err := template(L, info.fullpath)
-				if err != "" {
-					fmt.eprintln(string(err))
-					return
-				}
-
-				ok := os.write_entire_file(dst, transmute([]u8)tmpl)
-				if !ok {
-					fmt.eprintln("failed to write file: ", dst)
-				}
-			} else {
-				contents, ok := os.read_entire_file(info.fullpath)
-				if !ok {
-					fmt.eprintln("failed to read file: ", info.fullpath)
-					return
-				}
-
-				ok = os.write_entire_file(dst, contents)
-				if !ok {
-					fmt.eprintln("failed to write file: ", dst)
-				}
-			}
+		err := build_dir(L, os.args[2], os.args[3])
+		if err != .None {
+			fmt.eprintln("There was an error building the directory", err)
 		}
 	case:
 		usage()
